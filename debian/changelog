@@ -1,0 +1,5 @@
+calico-cni-plugin (3.4.0-1) UNRELEASED; urgency=medium
+
+  * Initial release
+
+ -- Maximilian Falkenstein <maximilian.falkenstein@sos.ethz.ch>  Sat, 16 Mar 2019 15:12:49 +0100

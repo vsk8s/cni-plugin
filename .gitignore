@@ -1,3 +1,4 @@
+obj-*
 .go-pkg-cache
 dist
 bin
