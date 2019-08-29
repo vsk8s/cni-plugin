@@ -187,20 +187,35 @@ func DoNetworking(
 				return fmt.Errorf("failed to set net.ipv6.conf.lo.disable_ipv6=0: %s", err)
 			}
 
-			// No need to add a dummy next hop route as the host veth device will already have an IPv6
-			// link local address that can be used as a next hop.
-			// Just fetch the address of the host end of the veth and use it as the next hop.
-			addresses, err := netlink.AddrList(hostVeth, netlink.FAMILY_V6)
-			if err != nil {
-				logger.Errorf("Error listing IPv6 addresses for the host side of the veth pair: %s", err)
-				return err
+			// Retry several times as the LL can take a several micro/miliseconds to initialize and we may be too fast
+			// after these sysctls
+			var err error
+			var addresses []netlink.Addr
+			for i := 0; i < 10; i++ {
+				// No need to add a dummy next hop route as the host veth device will already have an IPv6
+				// link local address that can be used as a next hop.
+				// Just fetch the address of the host end of the veth and use it as the next hop.
+				addresses, err = netlink.AddrList(hostVeth, netlink.FAMILY_V6)
+				if err != nil {
+					logger.Errorf("Error listing IPv6 addresses for the host side of the veth pair: %s", err)
+				}
+
+				if len(addresses) < 1 {
+					// If the hostVeth doesn't have an IPv6 address then this host probably doesn't
+					// support IPv6. Since a IPv6 address has been allocated that can't be used,
+					// return an error.
+					err = fmt.Errorf("failed to get IPv6 addresses for host side of the veth pair")
+				}
+				if err == nil {
+					break
+				}
+
+				logger.Infof("No IPv6 set on interface, retrying..")
+				time.Sleep(50 * time.Millisecond)
 			}
 
-			if len(addresses) < 1 {
-				// If the hostVeth doesn't have an IPv6 address then this host probably doesn't
-				// support IPv6. Since a IPv6 address has been allocated that can't be used,
-				// return an error.
-				return fmt.Errorf("failed to get IPv6 addresses for host side of the veth pair")
+			if err != nil {
+				return err
 			}
 
 			hostIPv6Addr := addresses[0].IP
@@ -321,6 +336,12 @@ func configureSysctls(hostVethName string, hasIPv4, hasIPv6 bool) error {
 	var err error
 
 	if hasIPv4 {
+		// Normally, the kernel has a delay before responding to proxy ARP but we know
+		// that's not needed in a Calico network so we disable it.
+		if err = writeProcSys(fmt.Sprintf("/proc/sys/net/ipv4/neigh/%s/proxy_delay", hostVethName), "0"); err != nil {
+			return fmt.Errorf("failed to set net.ipv4.neigh.%s.proxy_delay=0: %s", hostVethName, err)
+		}
+
 		// Enable proxy ARP, this makes the host respond to all ARP requests with its own
 		// MAC. We install explicit routes into the containers network
 		// namespace and we use a link-local address for the gateway.  Turing on proxy ARP
@@ -329,12 +350,6 @@ func configureSysctls(hostVethName string, hasIPv4, hasIPv6 bool) error {
 		// thing we may clash over.
 		if err = writeProcSys(fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/proxy_arp", hostVethName), "1"); err != nil {
 			return fmt.Errorf("failed to set net.ipv4.conf.%s.proxy_arp=1: %s", hostVethName, err)
-		}
-
-		// Normally, the kernel has a delay before responding to proxy ARP but we know
-		// that's not needed in a Calico network so we disable it.
-		if err = writeProcSys(fmt.Sprintf("/proc/sys/net/ipv4/neigh/%s/proxy_delay", hostVethName), "0"); err != nil {
-			return fmt.Errorf("failed to set net.ipv4.neigh.%s.proxy_delay=0: %s", hostVethName, err)
 		}
 
 		// Enable IP forwarding of packets coming _from_ this interface.  For packets to
@@ -432,7 +447,7 @@ func CleanUpNamespace(args *skel.CmdArgs, logger *logrus.Entry) error {
 		})
 
 		if devErr == nil {
-			fmt.Fprintf(os.Stderr, "Calico CNI deleting device in netns %s\n", args.Netns)
+			logger.Infof("Calico CNI deleting device in netns %s", args.Netns)
 			// Deleting the veth has been seen to hang on some kernel version. Timeout the command if it takes too long.
 			ch := make(chan error, 1)
 
@@ -449,7 +464,7 @@ func CleanUpNamespace(args *skel.CmdArgs, logger *logrus.Entry) error {
 				if err != nil {
 					return err
 				} else {
-					fmt.Fprintf(os.Stderr, "Calico CNI deleted device in netns %s\n", args.Netns)
+					logger.Infof("Calico CNI deleted device in netns %s", args.Netns)
 				}
 			case <-time.After(5 * time.Second):
 				return fmt.Errorf("Calico CNI timed out deleting device in netns %s", args.Netns)
