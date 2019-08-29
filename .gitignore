@@ -5,7 +5,6 @@ bin
 kubeconfig
 .idea
 *~
-vendor
 net.d
 addstats
 delstats

@@ -3,9 +3,6 @@ include /usr/share/dpkg/pkg-info.mk
 export GOPATH
 
 override_dh_auto_clean:
-	-mkdir /tmp/foo
-	-mkdir /tmp/foo/src
-	GOPATH=/tmp/foo glide i -strip-vendor
 	dh_auto_clean -O--buildsystem=golang
 
 override_dh_auto_install:
