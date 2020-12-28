@@ -1,2 +1,1 @@
 _build/bin/calico /opt/cni/bin/
-_build/bin/calico-ipam /opt/cni/bin/

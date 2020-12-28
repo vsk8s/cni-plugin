@@ -2,7 +2,8 @@
 include /usr/share/dpkg/pkg-info.mk
 
 GO_LDFLAGS += -X main.VERSION=$(shell git rev-parse HEAD || echo '<unknown>')
-
+DH_GOLANG_EXCLUDES += win_tests
+export DH_GOLANG_EXCLUDES
 export CGO_CFLAGS            := $(CFLAGS)
 export CGO_CPPFLAGS          := $(CPPFLAGS)
 export GO111MODULE=on
