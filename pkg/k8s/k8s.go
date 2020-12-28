@@ -1,4 +1,4 @@
-// Copyright 2015 Tigera Inc
+// Copyright (c) 2015-2020 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,23 +22,27 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	cnitypes "github.com/containernetworking/cni/pkg/types"
 	"github.com/containernetworking/cni/pkg/types/current"
 	"github.com/containernetworking/plugins/pkg/ipam"
-	"github.com/projectcalico/cni-plugin/internal/pkg/utils"
-	"github.com/projectcalico/cni-plugin/pkg/types"
+	"github.com/sirupsen/logrus"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
+
 	api "github.com/projectcalico/libcalico-go/lib/apis/v3"
 	k8sconversion "github.com/projectcalico/libcalico-go/lib/backend/k8s/conversion"
 	calicoclient "github.com/projectcalico/libcalico-go/lib/clientv3"
 	cerrors "github.com/projectcalico/libcalico-go/lib/errors"
 	cnet "github.com/projectcalico/libcalico-go/lib/net"
 	"github.com/projectcalico/libcalico-go/lib/options"
-	"github.com/sirupsen/logrus"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
+
+	"github.com/projectcalico/cni-plugin/internal/pkg/utils"
+	"github.com/projectcalico/cni-plugin/pkg/dataplane"
+	"github.com/projectcalico/cni-plugin/pkg/types"
 )
 
 // CmdAddK8s performs the "ADD" operation on a kubernetes pod
@@ -48,7 +52,7 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 	var err error
 	var result *current.Result
 
-	utils.ConfigureLogging(conf.LogLevel)
+	utils.ConfigureLogging(conf)
 
 	logger := logrus.WithFields(logrus.Fields{
 		"WorkloadEndpoint": epIDs.WEPName,
@@ -57,11 +61,21 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 		"Namespace":        epIDs.Namespace,
 	})
 
+	d, err := dataplane.GetDataplane(conf, logger)
+	if err != nil {
+		return nil, err
+	}
+
 	logger.Info("Extracted identifiers for CmdAddK8s")
+
+	result, err = utils.CheckForSpuriousAdd(args, conf, epIDs, endpoint, logger)
+	if result != nil || err != nil {
+		return result, err
+	}
 
 	// Allocate the IP and update/create the endpoint. Do this even if the endpoint already exists and has an IP
 	// allocation. The kubelet will send a DEL call for any old containers and we'll clean up the old IPs then.
-	client, err := newK8sClient(conf, logger)
+	client, err := NewK8sClient(conf, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +172,6 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 
 	labels := make(map[string]string)
 	annot := make(map[string]string)
-	annotNS := make(map[string]string)
 
 	var ports []api.EndpointPort
 	var profiles []string
@@ -169,9 +182,7 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 	// run the plugin under Kubernetes without needing it to access the
 	// Kubernetes API
 	if conf.Policy.PolicyType == "k8s" {
-		var err error
-
-		annotNS, err = getK8sNSInfo(client, epIDs.Namespace)
+		annotNS, err := getK8sNSInfo(client, epIDs.Namespace)
 		if err != nil {
 			return nil, err
 		}
@@ -368,8 +379,9 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 	}
 
 	// Whether the endpoint existed or not, the veth needs (re)creating.
-	hostVethName := k8sconversion.VethNameForWorkload(epIDs.Namespace, epIDs.Pod)
-	_, contVethMac, err := utils.DoNetworking(args, conf, result, logger, hostVethName, routes)
+	desiredVethName := k8sconversion.NewConverter().VethNameForWorkload(epIDs.Namespace, epIDs.Pod)
+	hostVethName, contVethMac, err := d.DoNetworking(
+		ctx, calicoClient, args, result, desiredVethName, routes, endpoint, annot)
 	if err != nil {
 		logger.WithError(err).Error("Error setting up networking")
 		releaseIPAM()
@@ -387,6 +399,23 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 	endpoint.Spec.ContainerID = epIDs.ContainerID
 	logger.WithField("endpoint", endpoint).Info("Added Mac, interface name, and active container ID to endpoint")
 
+	if conf.Mode == "vxlan" {
+		_, subNet, _ := net.ParseCIDR(result.IPs[0].Address.String())
+		var err error
+		for attempts := 3; attempts > 0; attempts-- {
+			err = utils.EnsureVXLANTunnelAddr(ctx, calicoClient, epIDs.Node, subNet, conf)
+			if err != nil {
+				logger.WithError(err).Warn("Failed to set node's VXLAN tunnel IP, node may not receive traffic.  May retry...")
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			break
+		}
+		if err != nil {
+			logger.WithError(err).Error("Failed to set node's VXLAN tunnel IP after retries, node may not receive traffic.")
+		}
+	}
+
 	// List of DNAT ipaddrs to map to this workload endpoint
 	floatingIPs := annot["cni.projectcalico.org/floatingIPs"]
 
@@ -402,11 +431,36 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 			return nil, err
 		}
 
+		// Get IPv4 and IPv6 targets for NAT
+		var podnetV4, podnetV6 net.IPNet
+		for _, ipNet := range result.IPs {
+			if ipNet.Address.IP.To4() != nil {
+				podnetV4 = ipNet.Address
+				netmask, _ := podnetV4.Mask.Size()
+				if netmask != 32 {
+					return nil, fmt.Errorf("PodIP %v is not a valid IPv4: Mask size is %d, not 32", ipNet, netmask)
+				}
+			} else {
+				podnetV6 = ipNet.Address
+				netmask, _ := podnetV6.Mask.Size()
+				if netmask != 128 {
+					return nil, fmt.Errorf("PodIP %v is not a valid IPv6: Mask size is %d, not 128", ipNet, netmask)
+				}
+			}
+		}
+
 		for _, ip := range ips {
-			endpoint.Spec.IPNATs = append(endpoint.Spec.IPNATs, api.IPNAT{
-				InternalIP: result.IPs[0].Address.IP.String(),
-				ExternalIP: ip,
-			})
+			if strings.Contains(ip, ":") {
+				endpoint.Spec.IPNATs = append(endpoint.Spec.IPNATs, api.IPNAT{
+					InternalIP: podnetV6.IP.String(),
+					ExternalIP: ip,
+				})
+			} else {
+				endpoint.Spec.IPNATs = append(endpoint.Spec.IPNATs, api.IPNAT{
+					InternalIP: podnetV4.IP.String(),
+					ExternalIP: ip,
+				})
+			}
 		}
 		logger.WithField("endpoint", endpoint).Info("Added floatingIPs to endpoint")
 	}
@@ -433,49 +487,76 @@ func CmdAddK8s(ctx context.Context, args *skel.CmdArgs, conf types.NetConf, epID
 // it means the DEL is for an old sandbox and the pod is still running. We should still clean up IPAM allocations, since they are identified by the
 // container ID rather than the pod name and namespace. If they do match, then we can delete the workload endpoint.
 func CmdDelK8s(ctx context.Context, c calicoclient.Interface, epIDs utils.WEPIdentifiers, args *skel.CmdArgs, conf types.NetConf, logger *logrus.Entry) error {
-	wep, err := c.WorkloadEndpoints().Get(ctx, epIDs.Namespace, epIDs.WEPName, options.GetOptions{})
+	d, err := dataplane.GetDataplane(conf, logger)
 	if err != nil {
-		if _, ok := err.(cerrors.ErrorResourceDoesNotExist); !ok {
-			// Could not connect to datastore (connection refused, unauthorized, etc.)
-			// so we have no way of knowing/checking ContainerID. To protect the endpoint
-			// from false DEL, we return the error without deleting/cleaning up.
-			return err
-		}
+		return err
+	}
 
-		// The WorkloadEndpoint doesn't exist for some reason. We should still try to clean up any IPAM allocations
-		// if they exist, so continue DEL processing.
-		logger.WithField("WorkloadEndpoint", epIDs.WEPName).Warning("WorkloadEndpoint does not exist in the datastore, moving forward with the clean up")
-	} else if wep.Spec.ContainerID != "" && args.ContainerID != wep.Spec.ContainerID {
-		// If the ContainerID is populated and doesn't match the CNI_CONATINERID provided for this execution, then
-		// we shouldn't delete the workload endpoint. We identify workload endpoints based on pod name and namespace, which means
-		// we can receive DEL commands for an old sandbox for a currently running pod. However, we key IPAM allocations based on the
-		// CNI_CONTAINERID, so we should still do that below for this case.
-		logger.WithField("WorkloadEndpoint", wep).Warning("CNI_CONTAINERID does not match WorkloadEndpoint ConainerID, don't delete WEP.")
-	} else if _, err = c.WorkloadEndpoints().Delete(ctx, wep.Namespace, wep.Name, options.DeleteOptions{}); err != nil {
-		// Delete the WorkloadEndpoint object from the datastore, passing revision information from the
-		// queried resource above in order to prevent conflicts.
-		switch err := err.(type) {
-		case cerrors.ErrorResourceDoesNotExist:
-			// Log and proceed with the clean up if WEP doesn't exist.
-			logger.WithField("endpoint", wep).Info("Endpoint object does not exist, no need to clean up.")
-		case cerrors.ErrorResourceUpdateConflict:
-			// This case means the WEP object was modified between the time we did the Get and now,
-			// so it's not a safe Compare-and-Delete operation, so log and abort with the error.
-			// Returning an error here is with the assumption that k8s (kubelet) retries deleting again.
-			logger.WithField("endpoint", wep).Warning("Error deleting endpoint: endpoint was modified before it could be deleted.")
-			return fmt.Errorf("error deleting endpoint: endpoint was modified before it could be deleted: %v", err)
-		case cerrors.ErrorOperationNotSupported:
-			// KDD does not support WorkloadEndpoint deletion, the WEP is backed by the Pod and the
-			// deletion will be handled by Kubernetes. This error can be ignored.
-			logger.WithField("endpoint", wep).Info("Endpoint deletion will be handled by Kubernetes deletion of the Pod.")
-		default:
-			return err
+	// Register timestamp before deleting wep. This is important.
+	// Because with ADD command running in parallel checking wep before checking timestamp,
+	// DEL command should run the process in reverse order to avoid race condition.
+	err = utils.RegisterDeletedWep(args.ContainerID)
+	if err != nil {
+		logger.WithError(err).Warn("Failed to register pod deletion timestamp.")
+		return err
+	}
+
+	for attempts := 5; attempts >= 0; attempts-- {
+		wep, err := c.WorkloadEndpoints().Get(ctx, epIDs.Namespace, epIDs.WEPName, options.GetOptions{})
+		if err != nil {
+			if _, ok := err.(cerrors.ErrorResourceDoesNotExist); !ok {
+				// Could not connect to datastore (connection refused, unauthorized, etc.)
+				// so we have no way of knowing/checking ContainerID. To protect the endpoint
+				// from false DEL, we return the error without deleting/cleaning up.
+				return err
+			}
+
+			// The WorkloadEndpoint doesn't exist for some reason. We should still try to clean up any IPAM allocations
+			// if they exist, so continue DEL processing.
+			logger.WithField("WorkloadEndpoint", epIDs.WEPName).Warning("WorkloadEndpoint does not exist in the datastore, moving forward with the clean up")
+		} else if wep.Spec.ContainerID != "" && args.ContainerID != wep.Spec.ContainerID {
+			// If the ContainerID is populated and doesn't match the CNI_CONTAINERID provided for this execution, then
+			// we shouldn't delete the workload endpoint. We identify workload endpoints based on pod name and namespace, which means
+			// we can receive DEL commands for an old sandbox for a currently running pod. However, we key IPAM allocations based on the
+			// CNI_CONTAINERID, so we should still do that below for this case.
+			logger.WithField("WorkloadEndpoint", wep).Warning("CNI_CONTAINERID does not match WorkloadEndpoint ConainerID, don't delete WEP.")
+		} else if _, err = c.WorkloadEndpoints().Delete(
+			ctx,
+			wep.Namespace,
+			wep.Name,
+			options.DeleteOptions{
+				ResourceVersion: wep.ResourceVersion,
+				UID:             &wep.UID,
+			},
+		); err != nil {
+			// Delete the WorkloadEndpoint object from the datastore, passing revision information from the
+			// queried resource above in order to prevent conflicts.
+			switch err := err.(type) {
+			case cerrors.ErrorResourceDoesNotExist:
+				// Log and proceed with the clean up if WEP doesn't exist.
+				logger.WithField("endpoint", wep).Info("Endpoint object does not exist, no need to clean up.")
+			case cerrors.ErrorResourceUpdateConflict:
+				// This case means the WEP object was modified between the time we did the Get and now, retry
+				// a few times and then return the error.  kubelet should then retry the whole DEL later.
+				if attempts == 0 {
+					logger.WithField("endpoint", wep).Warn("Endpoint was modified before it could be deleted.  Giving up.")
+					return fmt.Errorf("error deleting endpoint: endpoint was modified before it could be deleted: %v", err)
+				}
+				logger.WithField("endpoint", wep).Info("Endpoint was modified before it could be deleted.  Retrying...")
+				continue
+			case cerrors.ErrorOperationNotSupported:
+				// Defensive: shouldn't be hittable any more since KDD now supports pod deletion.
+				logger.WithField("endpoint", wep).WithError(err).Warn("Deleting pod returned ErrorOperationNotSupported.")
+			default:
+				return err
+			}
 		}
+		break
 	}
 
 	// Clean up namespace by removing the interfaces.
 	logger.Info("Cleaning up netns")
-	err = utils.CleanUpNamespace(args, logger)
+	err = d.CleanUpNamespace(args)
 	if err != nil {
 		return err
 	}
@@ -726,7 +807,7 @@ func parseIPAddrs(ipAddrsStr string, logger *logrus.Entry) ([]string, error) {
 	return ips, nil
 }
 
-func newK8sClient(conf types.NetConf, logger *logrus.Entry) (*kubernetes.Clientset, error) {
+func NewK8sClient(conf types.NetConf, logger *logrus.Entry) (*kubernetes.Clientset, error) {
 	// Some config can be passed in a kubeconfig file
 	kubeconfig := conf.Kubernetes.Kubeconfig
 
@@ -775,7 +856,7 @@ func newK8sClient(conf types.NetConf, logger *logrus.Entry) (*kubernetes.Clients
 
 func getK8sNSInfo(client *kubernetes.Clientset, podNamespace string) (annotations map[string]string, err error) {
 	ns, err := client.CoreV1().Namespaces().Get(podNamespace, metav1.GetOptions{})
-	logrus.Infof("namespace info %+v", ns)
+	logrus.Debugf("namespace info %+v", ns)
 	if err != nil {
 		return nil, err
 	}
@@ -784,17 +865,18 @@ func getK8sNSInfo(client *kubernetes.Clientset, podNamespace string) (annotation
 
 func getK8sPodInfo(client *kubernetes.Clientset, podName, podNamespace string) (labels map[string]string, annotations map[string]string, ports []api.EndpointPort, profiles []string, generateName string, err error) {
 	pod, err := client.CoreV1().Pods(string(podNamespace)).Get(podName, metav1.GetOptions{})
-	logrus.Infof("pod info %+v", pod)
+	logrus.Debugf("pod info %+v", pod)
 	if err != nil {
 		return nil, nil, nil, nil, "", err
 	}
 
-	var c k8sconversion.Converter
-	kvp, err := c.PodToWorkloadEndpoint(pod)
+	c := k8sconversion.NewConverter()
+	kvps, err := c.PodToWorkloadEndpoints(pod)
 	if err != nil {
 		return nil, nil, nil, nil, "", err
 	}
 
+	kvp := kvps[0]
 	ports = kvp.Value.(*api.WorkloadEndpoint).Spec.Ports
 	labels = kvp.Value.(*api.WorkloadEndpoint).Labels
 	profiles = kvp.Value.(*api.WorkloadEndpoint).Spec.Profiles

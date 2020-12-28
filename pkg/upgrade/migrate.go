@@ -1,4 +1,4 @@
-// Copyright 2015-2019 Tigera Inc
+// Copyright (c) 2015-2020 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -97,13 +97,9 @@ func Migrate(ctxt context.Context, c client.Interface, nodename string) error {
 				return fmt.Errorf("Cannot pick an IPv4 tunnel address from the given CIDR: %s", k8sNode.Spec.PodCIDR)
 			}
 			tunIp[3]++
-			if node.Spec.BGP == nil {
-				node.Spec.BGP = &v3.NodeBGPSpec{}
-			}
-			node.Spec.BGP.IPv4IPIPTunnelAddr = tunIp.String()
 
 			// Assign the address via Calico IPAM.
-			ipipTunnelAddr := cnet.ParseIP(node.Spec.BGP.IPv4IPIPTunnelAddr)
+			ipipTunnelAddr := cnet.ParseIP(tunIp.String())
 			handle := fmt.Sprintf("ipip-tunnel-addr-%s", nodename)
 			if err = c.IPAM().AssignIP(ctxt, ipam.AssignIPArgs{
 				IP:       *ipipTunnelAddr,
@@ -115,14 +111,31 @@ func Migrate(ctxt context.Context, c client.Interface, nodename string) error {
 				},
 			}); err != nil {
 				if _, ok := err.(errors.ErrorResourceAlreadyExists); !ok {
-					return fmt.Errorf("failed to get add IPIP tunnel addr %s: %s", node.Spec.BGP.IPv4IPIPTunnelAddr, err)
+					return fmt.Errorf("failed to get add IPIP tunnel addr %s: %s", tunIp.String(), err)
 				}
 				log.Info("IPIP tunnel address already assigned in IPAM, continuing...")
 			}
 
-			// Save the calico node object to the datastore.
-			if node, err = c.Nodes().Update(ctxt, node, options.SetOptions{}); err != nil {
-				return fmt.Errorf("failed to save newly updated node object: %s", err)
+			// Implemented retry on conflict, because we get stuck if the upgrade-ipam
+			// container fails here and retries assigning an IP which is already assigned
+			for i := uint(0); i < 5; i++ {
+				node, err := c.Nodes().Get(ctxt, nodename, options.GetOptions{})
+				if err != nil {
+					return fmt.Errorf("failed to get calico node resource: %s", err)
+				}
+				if node.Spec.BGP == nil {
+					node.Spec.BGP = &v3.NodeBGPSpec{}
+				}
+				node.Spec.BGP.IPv4IPIPTunnelAddr = tunIp.String()
+				if _, err = c.Nodes().Update(ctxt, node, options.SetOptions{}); err != nil {
+					if _, ok := err.(errors.ErrorResourceUpdateConflict); ok {
+						log.Info("Encountered update conflict, retrying...")
+						time.Sleep(1 * time.Second)
+						continue
+					}
+					return fmt.Errorf("failed to update node: %s", err)
+				}
+				break
 			}
 
 			log.WithField("ip", node.Spec.BGP.IPv4IPIPTunnelAddr).Info("Assigned IPIP tunnel address to node")
@@ -275,7 +288,8 @@ func Migrate(ctxt context.Context, c client.Interface, nodename string) error {
 		if err != nil {
 			return fmt.Errorf("failed to read file %s: %s", fname, err)
 		}
-		containerID := string(b)
+		// The containerID is the first line in the file.
+		containerID := strings.TrimSpace(strings.Split(string(b), "\n")[0])
 
 		// Get the pod resource associated with the IP.
 		pod, ok := podIPMap[f.Name()]
@@ -324,25 +338,28 @@ func Migrate(ctxt context.Context, c client.Interface, nodename string) error {
 		log.Info("successfully released lock on host-local backend!")
 	}
 
+	// Re-enable datastoreReady if this is the last node to update. We know this is the last
+	// node to update if the number of UpdatedNumberScheduled is MaxUnavailable less than the
+	// DesiredNumberScheduled.
+	calicoDS, err := k8sClient.AppsV1().DaemonSets("kube-system").Get("calico-node", metav1.GetOptions{})
+	if err != nil {
+		log.WithError(err).Error("failed to retrieve Calico daemonset to check if datastore readiness should be set to true")
+	} else if calicoDS.Status.UpdatedNumberScheduled == calicoDS.Status.DesiredNumberScheduled-calicoDS.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable.IntVal {
+		log.Info("setting Calico datastore readiness to true...")
+		t := true
+		clusterInfo.Spec.DatastoreReady = &t
+		if _, err = c.ClusterInformation().Update(ctxt, clusterInfo, options.SetOptions{}); err != nil {
+			return fmt.Errorf("failed to re-enable cluster: %s", err)
+		}
+		log.Info("successfully set Calico datastore readiness to true!")
+	}
+
 	// Delete the host-local IPAM data directory.
 	log.Info("removing host-local IPAM data directory")
 	if err = os.RemoveAll(ipAllocPath); err != nil && !os.IsNotExist(err) {
 		log.WithError(err).Error("failed to remove host-local IPAM data dir directory")
 	}
 	log.Info("successfully removed host-local IPAM data directory!")
-
-	// HACK: Always re-enable datastoreReady.
-	// TODO: Should check DaemonSet rolling update status to see if this is the last node to update and
-	// only re-enable datastoreReady if the number of UpdatedNumberScheduled is MaxUnavailable less than the DesiredNumberScheduled.
-	// calicoDS, err := k8sClient.AppsV1().DaemonSets("kube-system").Get("calico-node", metav1.GetOptions{})
-	// if (calicoDS.Status.UpdatedNumberScheduled == calicoDS.Status.DesiredNumberScheduled-calicoDS.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable.IntVal)
-	log.Info("setting Calico datastore readiness to true...")
-	t := true
-	clusterInfo.Spec.DatastoreReady = &t
-	if _, err = c.ClusterInformation().Update(ctxt, clusterInfo, options.SetOptions{}); err != nil {
-		return fmt.Errorf("failed to re-enable cluster: %s", err)
-	}
-	log.Info("successfully set Calico datastore readiness to true!")
 
 	return nil
 }

@@ -1,5 +1,5 @@
-// Copyright (c) 2018 Tigera, Inc. All rights reserved.
-
+// Copyright 2018 Tigera Inc
+//
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -11,23 +11,32 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
-package azure
+package utils
 
 import (
-	"testing"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
-
-	"github.com/onsi/ginkgo/reporters"
-
-	"github.com/projectcalico/libcalico-go/lib/testutils"
+	"net"
 )
 
-func TestIpam(t *testing.T) {
-	testutils.HookLogrusForGinkgo()
-	RegisterFailHandler(Fail)
-	junitReporter := reporters.NewJUnitReporter("../../../report/azure_suite.xml")
-	RunSpecsWithDefaultAndCustomReporters(t, "Azure Suite", []Reporter{junitReporter})
+var (
+	// IPv4AllNet represents the IPv4 all-addresses CIDR 0.0.0.0/0.
+	IPv4AllNet *net.IPNet
+	// IPv6AllNet represents the IPv6 all-addresses CIDR ::/0.
+	IPv6AllNet    *net.IPNet
+	DefaultRoutes []*net.IPNet
+)
+
+func init() {
+	var err error
+	_, IPv4AllNet, err = net.ParseCIDR("0.0.0.0/0")
+	if err != nil {
+		panic(err)
+	}
+	_, IPv6AllNet, err = net.ParseCIDR("::/0")
+	if err != nil {
+		panic(err)
+	}
+	DefaultRoutes = []*net.IPNet{
+		IPv4AllNet,
+		IPv6AllNet, // Only used if we end up adding a v6 address.
+	}
 }

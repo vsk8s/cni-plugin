@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2019 Tigera, Inc. All rights reserved.
+// Copyright (c) 2015-2020 Tigera, Inc. All rights reserved.
 
 package main_test
 
@@ -11,15 +11,16 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
+	uuid "github.com/satori/go.uuid"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
+
 	"github.com/projectcalico/cni-plugin/internal/pkg/testutils"
 	client "github.com/projectcalico/libcalico-go/lib/clientv3"
 	"github.com/projectcalico/libcalico-go/lib/ipam"
 	"github.com/projectcalico/libcalico-go/lib/names"
 	cnet "github.com/projectcalico/libcalico-go/lib/net"
 	"github.com/projectcalico/libcalico-go/lib/options"
-	"github.com/satori/go.uuid"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
 )
 
 var plugin = "calico-ipam"
@@ -80,11 +81,11 @@ var _ = Describe("Calico IPAM Tests", func() {
 				}
 
 				if expectedIPv4 {
-					Expect(ip4Mask).Should(Equal("ffffffff"))
+					Expect(ip4Mask).Should(Equal("ffffffc0"))
 				}
 
 				if expectedIPv6 {
-					Expect(ip6Mask).Should(Equal("ffffffffffffffffffffffffffffffff"))
+					Expect(ip6Mask).Should(Equal("ffffffffffffffffffffffffffffffc0"))
 				}
 
 				_, _, exitCode := testutils.RunIPAMPlugin(netconf, "DEL", "", cid, cniVersion)
@@ -335,7 +336,7 @@ var _ = Describe("Calico IPAM Tests", func() {
 				result, _, _ := testutils.RunIPAMPlugin(netconf, "ADD", "IP=192.168.123.123", cid, cniVersion)
 				Expect(len(result.IPs)).Should(Equal(1))
 				Expect(result.IPs[0].Address.String()).Should(Equal("192.168.123.123/32"))
-				result, _, exitCode := testutils.RunIPAMPlugin(netconf, "ADD", "IP=192.168.123.123", cid, cniVersion)
+				_, _, exitCode := testutils.RunIPAMPlugin(netconf, "ADD", "IP=192.168.123.123", cid, cniVersion)
 				Expect(exitCode).Should(BeNumerically(">", 0))
 			})
 		})

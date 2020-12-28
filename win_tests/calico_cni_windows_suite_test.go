@@ -1,5 +1,5 @@
-// Copyright (c) 2018 Tigera, Inc. All rights reserved.
-
+// Copyright (c) 2018-2020 Tigera, Inc. All rights reserved.
+//
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -12,22 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package azure
+package main_windows_test
 
 import (
-	"testing"
-
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 
-	"github.com/onsi/ginkgo/reporters"
+	"os"
+	"testing"
 
-	"github.com/projectcalico/libcalico-go/lib/testutils"
+	"github.com/onsi/ginkgo/reporters"
 )
 
-func TestIpam(t *testing.T) {
-	testutils.HookLogrusForGinkgo()
+func TestCalicoCni(t *testing.T) {
 	RegisterFailHandler(Fail)
-	junitReporter := reporters.NewJUnitReporter("../../../report/azure_suite.xml")
-	RunSpecsWithDefaultAndCustomReporters(t, "Azure Suite", []Reporter{junitReporter})
+	junitReporter := reporters.NewJUnitReporter(os.Getenv("REPORT"))
+	RunSpecsWithDefaultAndCustomReporters(t, "CalicoCni windows Suite", []Reporter{junitReporter})
 }

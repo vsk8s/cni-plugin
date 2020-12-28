@@ -1,5 +1,5 @@
-// Copyright (c) 2018 Tigera, Inc. All rights reserved.
-
+// Copyright (c) 2018-2020 Tigera, Inc. All rights reserved.
+//
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -12,15 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package main
+package dataplane
 
 import (
-	"github.com/projectcalico/cni-plugin/pkg/ipamplugin"
+	"github.com/projectcalico/cni-plugin/pkg/dataplane/windows"
+	"github.com/projectcalico/cni-plugin/pkg/types"
+	"github.com/sirupsen/logrus"
 )
 
-// VERSION is filled out during the build process (using git describe output)
-var VERSION string
-
-func main() {
-	ipamplugin.Main(VERSION)
+func getDefaultSystemDataplane(conf types.NetConf, logger *logrus.Entry) (Dataplane, error) {
+	return windows.NewWindowsDataplane(conf, logger), nil
 }

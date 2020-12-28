@@ -1,52 +1,147 @@
-# Shortcut targets
-default: build
+PACKAGE_NAME=github.com/projectcalico/cni-plugin
+GO_BUILD_VER=v0.49
 
-## Build binary for current platform
-all: build
+# This needs to be evaluated before the common makefile is included.
+# This var contains some default values that the common makefile may append to.
+PUSH_IMAGES?=$(BUILD_IMAGE) quay.io/calico/cni
 
-## Run the tests for the current platform/architecture
-test: ut test-install-cni
+SEMAPHORE_PROJECT_ID?=$(SEMAPHORE_CNI_PLUGIN_PROJECT_ID)
+
+# Used so semaphore can trigger the update pin pipelines in projects that have this project as a dependency.
+SEMAPHORE_AUTO_PIN_UPDATE_PROJECT_IDS=$(SEMAPHORE_NODE_PROJECT_ID)
 
 ###############################################################################
-# Both native and cross architecture builds are supported.
-# The target architecture is select by setting the ARCH variable.
-# When ARCH is undefined it is set to the detected host architecture.
-# When ARCH differs from the host architecture a crossbuild will be performed.
-ARCHES=$(patsubst Dockerfile.%,%,$(wildcard Dockerfile.*))
+# Download and include Makefile.common
+#   Additions to EXTRA_DOCKER_ARGS need to happen before the include since
+#   that variable is evaluated when we declare DOCKER_RUN and siblings.
+###############################################################################
+MAKE_BRANCH?=$(GO_BUILD_VER)
+MAKE_REPO?=https://raw.githubusercontent.com/projectcalico/go-build/$(MAKE_BRANCH)
 
-# BUILDARCH is the host architecture
-# ARCH is the target architecture
-# we need to keep track of them separately
-BUILDARCH ?= $(shell uname -m)
+Makefile.common: Makefile.common.$(MAKE_BRANCH)
+	cp "$<" "$@"
+Makefile.common.$(MAKE_BRANCH):
+	# Clean up any files downloaded from other branches so they don't accumulate.
+	rm -f Makefile.common.*
+	curl --fail $(MAKE_REPO)/Makefile.common -o "$@"
 
-# canonicalized names for host architecture
-ifeq ($(BUILDARCH),aarch64)
-        BUILDARCH=arm64
-endif
-ifeq ($(BUILDARCH),x86_64)
-        BUILDARCH=amd64
-endif
-
-# unless otherwise set, I am building for my own architecture, i.e. not cross-compiling
-ARCH ?= $(BUILDARCH)
-
-# canonicalized names for target architecture
-ifeq ($(ARCH),aarch64)
-        override ARCH=arm64
-endif
-ifeq ($(ARCH),x86_64)
-        override ARCH=amd64
-endif
-
-# Build mounts for running in "local build" mode. Mount in libcalico, but null out
-# the vendor directory. This allows an easy build using local development code,
+# Build mounts for running in "local build" mode. This allows an easy build using local development code,
 # assuming that there is a local checkout of libcalico in the same directory as this repo.
-LOCAL_BUILD_MOUNTS ?=
-ifeq ($(LOCAL_BUILD),true)
-LOCAL_BUILD_MOUNTS = -v $(CURDIR)/../libcalico-go:/go/src/$(PACKAGE_NAME)/vendor/github.com/projectcalico/libcalico-go:ro \
-	-v $(CURDIR)/.empty:/go/src/$(PACKAGE_NAME)/vendor/github.com/projectcalico/libcalico-go/vendor:ro
+ifdef LOCAL_BUILD
+PHONY: set-up-local-build
+LOCAL_BUILD_DEP:=set-up-local-build
+
+EXTRA_DOCKER_ARGS+=-v $(CURDIR)/../libcalico-go:/go/src/github.com/projectcalico/libcalico-go:rw
+$(LOCAL_BUILD_DEP):
+	$(DOCKER_RUN) $(CALICO_BUILD) go mod edit -replace=github.com/projectcalico/libcalico-go=../libcalico-go
 endif
 
+include Makefile.common
+
+###############################################################################
+
+# fail if unable to download
+CURL=curl -C - -sSf
+
+CNI_VERSION=v0.8.6
+
+BUILD_IMAGE_ORG?=calico
+
+# By default set the CNI_SPEC_VERSION to 0.3.1 for tests.
+CNI_SPEC_VERSION?=0.3.1
+
+BUILD_IMAGE?=calico/cni
+DEPLOY_CONTAINER_MARKER=cni_deploy_container-$(ARCH).created
+
+RELEASE_IMAGES?=gcr.io/projectcalico-org/cni eu.gcr.io/projectcalico-org/cni asia.gcr.io/projectcalico-org/cni us.gcr.io/projectcalico-org/cni
+
+ETCD_CONTAINER ?= quay.io/coreos/etcd:$(ETCD_VERSION)-$(BUILDARCH)
+# If building on amd64 omit the arch in the container name.
+ifeq ($(BUILDARCH),amd64)
+	ETCD_CONTAINER=quay.io/coreos/etcd:$(ETCD_VERSION)
+endif
+
+.PHONY: clean
+clean:
+	rm -rf $(BIN) bin $(DEPLOY_CONTAINER_MARKER) .go-pkg-cache pkg/install/install.test 
+	rm -f *.created
+	rm -f crds.yaml
+	rm -rf config/
+	# If the vendor directory exists then the build fails with golang 1.14, and this folder exists in semaphore v1 but it's
+	# empty
+	rm -rf vendor/
+	rm Makefile.common*
+
+###############################################################################
+# Updating pins
+###############################################################################
+update-pins: update-libcalico-pin
+
+###############################################################################
+# Building the binary
+###############################################################################
+BIN=bin/$(ARCH)
+build: $(BIN)/install $(BIN)/calico $(BIN)/calico-ipam
+ifeq ($(ARCH),amd64)
+# Go only supports amd64 for Windows builds.
+BIN_WIN=bin/windows
+build: $(BIN_WIN)/calico.exe $(BIN_WIN)/calico-ipam.exe
+endif
+build-all: $(addprefix sub-build-,$(VALIDARCHES))
+sub-build-%:
+	$(MAKE) build ARCH=$*
+	
+## Build the Calico network plugin and ipam plugins
+$(BIN)/install binary: $(SRC_FILES)
+	-mkdir -p .go-pkg-cache
+	-mkdir -p $(BIN)
+	$(DOCKER_RUN) \
+	-e ARCH=$(ARCH) \
+	-e GOARCH=$(ARCH) \
+	-e LOCAL_USER_ID=$(LOCAL_USER_ID) \
+	-v $(CURDIR):/go/src/$(PACKAGE_NAME):rw \
+	-v $(CURDIR)/$(BIN):/go/src/$(PACKAGE_NAME)/$(BIN):rw \
+	$(LOCAL_BUILD_MOUNTS) \
+	-w /go/src/$(PACKAGE_NAME) \
+	-e GOCACHE=/go-cache \
+	    $(CALICO_BUILD) sh -c '$(GIT_CONFIG_SSH) \
+		go build -v -o $(BIN)/install -ldflags "-X main.VERSION=$(GIT_VERSION) -s -w" $(PACKAGE_NAME)/cmd/calico'
+
+## Build the Calico network plugin and ipam plugins for Windows
+$(BIN_WIN)/calico.exe $(BIN_WIN)/calico-ipam.exe: $(LOCAL_BUILD_DEP) $(SRC_FILES)
+	$(DOCKER_RUN) \
+	-e GOOS=windows \
+	    $(CALICO_BUILD) sh -c '$(GIT_CONFIG_SSH) \
+		go build -v -o $(BIN_WIN)/calico.exe -ldflags "-X main.VERSION=$(GIT_VERSION) -s -w" $(PACKAGE_NAME)/cmd/calico && \
+		go build -v -o $(BIN_WIN)/calico-ipam.exe -ldflags "-X main.VERSION=$(GIT_VERSION) -s -w" $(PACKAGE_NAME)/cmd/calico'
+
+
+###############################################################################
+# Building the image
+###############################################################################
+image: $(DEPLOY_CONTAINER_MARKER)
+image-all: $(addprefix sub-image-,$(VALIDARCHES))
+sub-image-%:
+	$(MAKE) image ARCH=$*
+
+$(DEPLOY_CONTAINER_MARKER): Dockerfile.$(ARCH) build fetch-cni-bins
+	GO111MODULE=on docker build -t $(BUILD_IMAGE):latest-$(ARCH) --build-arg QEMU_IMAGE=$(CALICO_BUILD) --build-arg GIT_VERSION=$(GIT_VERSION) -f Dockerfile.$(ARCH) .
+ifeq ($(ARCH),amd64)
+	# Need amd64 builds tagged as :latest because Semaphore depends on that
+	docker tag $(BUILD_IMAGE):latest-$(ARCH) $(BUILD_IMAGE):latest
+endif
+	touch $@
+
+.PHONY: fetch-cni-bins
+fetch-cni-bins: $(BIN)/flannel $(BIN)/loopback $(BIN)/host-local $(BIN)/portmap $(BIN)/tuning $(BIN)/bandwidth
+
+$(BIN)/flannel $(BIN)/loopback $(BIN)/host-local $(BIN)/portmap $(BIN)/tuning $(BIN)/bandwidth:
+	mkdir -p $(BIN)
+	$(CURL) -L --retry 5 https://github.com/containernetworking/plugins/releases/download/$(CNI_VERSION)/cni-plugins-linux-$(ARCH)-$(CNI_VERSION).tgz | tar -xz -C $(BIN) ./flannel ./loopback ./host-local ./portmap ./tuning ./bandwidth
+
+###############################################################################
+# Image build/push
+###############################################################################
 # we want to be able to run the same recipe on multiple targets keyed on the image name
 # to do that, we would use the entire image name, e.g. calico/node:abcdefg, as the stem, or '%', in the target
 # however, make does **not** allow the usage of invalid filename characters - like / and : - in a stem, and thus errors out
@@ -62,157 +157,6 @@ comma := ,
 prefix_linux = $(addprefix linux/,$(strip $1))
 join_platforms = $(subst $(space),$(comma),$(call prefix_linux,$(strip $1)))
 
-###############################################################################
-GO_BUILD_VER ?= v0.20
-
-SRC_FILES=$(shell find pkg cmd internal -name '*.go')
-TEST_SRC_FILES=$(shell find tests -name '*.go')
-LOCAL_IP_ENV?=$(shell ip route get 8.8.8.8 | head -1 | awk '{print $$7}')
-
-# If local build is set, then always build the binary since we might not
-# detect when another local repository has been modified.
-ifeq ($(LOCAL_BUILD),true)
-.PHONY: $(SRC_FILES) $(TEST_SRC_FILES)
-endif
-
-# fail if unable to download
-CURL=curl -C - -sSf
-
-K8S_VERSION?=v1.14.1
-CNI_VERSION=v0.8.0
-
-# Get version from git.
-GIT_VERSION:=$(shell git describe --tags --dirty --always)
-ifeq ($(LOCAL_BUILD),true)
-	GIT_VERSION = $(shell git describe --tags --dirty --always)-dev-build
-endif
-
-BUILD_IMAGE_ORG?=calico
-
-# By default set the CNI_SPEC_VERSION to 0.3.1 for tests.
-CNI_SPEC_VERSION?=0.3.1
-
-BIN=bin/$(ARCH)
-# Ensure that the bin directory is always created
-MAKE_SURE_BIN_EXIST := $(shell mkdir -p $(BIN))
-CALICO_BUILD?=$(BUILD_IMAGE_ORG)/go-build:$(GO_BUILD_VER)
-
-PACKAGE_NAME?=github.com/projectcalico/cni-plugin
-
-BUILD_IMAGE?=calico/cni
-DEPLOY_CONTAINER_MARKER=cni_deploy_container-$(ARCH).created
-
-PUSH_IMAGES?=$(BUILD_IMAGE) quay.io/calico/cni
-RELEASE_IMAGES?=gcr.io/projectcalico-org/cni eu.gcr.io/projectcalico-org/cni asia.gcr.io/projectcalico-org/cni us.gcr.io/projectcalico-org/cni
-
-# If this is a release, also tag and push additional images.
-ifeq ($(RELEASE),true)
-PUSH_IMAGES+=$(RELEASE_IMAGES)
-endif
-
-# remove from the list to push to manifest any registries that do not support multi-arch
-EXCLUDE_MANIFEST_REGISTRIES ?= quay.io/
-PUSH_MANIFEST_IMAGES=$(PUSH_IMAGES:$(EXCLUDE_MANIFEST_REGISTRIES)%=)
-PUSH_NONMANIFEST_IMAGES=$(filter-out $(PUSH_MANIFEST_IMAGES),$(PUSH_IMAGES))
-
-# location of docker credentials to push manifests
-DOCKER_CONFIG ?= $(HOME)/.docker/config.json
-
-# list of arches *not* to build when doing *-all
-#    until s390x works correctly
-EXCLUDEARCH ?= s390x
-VALIDARCHES = $(filter-out $(EXCLUDEARCH),$(ARCHES))
-
-ETCD_VER=v3.3.7
-ETCD_CONTAINER ?= quay.io/coreos/etcd:$(ETCD_VER)-$(BUILDARCH)
-# If building on amd64 omit the arch in the container name.
-ifeq ($(BUILDARCH),amd64)
-        ETCD_CONTAINER=quay.io/coreos/etcd:$(ETCD_VER)
-endif
-
-LIBCALICOGO_PATH?=none
-
-LOCAL_USER_ID?=$(shell id -u $$USER)
-
-.PHONY: clean
-clean:
-	rm -rf $(BIN) bin/github vendor $(DEPLOY_CONTAINER_MARKER) .go-pkg-cache k8s-install/scripts/install_cni.test
-	rm -f *.created
-
-###############################################################################
-# Building the binary
-###############################################################################
-build: $(BIN)/calico $(BIN)/calico-ipam
-build-all: $(addprefix sub-build-,$(VALIDARCHES))
-sub-build-%:
-	$(MAKE) build ARCH=$*
-
-## Create the vendor directory
-vendor: glide.yaml
-	# Ensure that the glide cache directory exists.
-	mkdir -p $(HOME)/.glide
-
-	# To build without Docker just run "glide install -strip-vendor"
-	if [ "$(LIBCALICOGO_PATH)" != "none" ]; then \
-	  EXTRA_DOCKER_BIND="-v $(LIBCALICOGO_PATH):/go/src/github.com/projectcalico/libcalico-go:ro"; \
-	fi; \
-	docker run --rm -i \
-	  -v $(CURDIR):/go/src/$(PACKAGE_NAME):rw $$EXTRA_DOCKER_BIND \
-	  -v $(HOME)/.glide:/home/user/.glide:rw \
-	  -e LOCAL_USER_ID=$(LOCAL_USER_ID) \
-	  -w /go/src/$(PACKAGE_NAME) \
-	  $(CALICO_BUILD) glide install -strip-vendor
-
-# Default the libcalico repo and version but allow them to be overridden
-LIBCALICO_BRANCH?=$(shell git rev-parse --abbrev-ref HEAD)
-LIBCALICO_REPO?=github.com/projectcalico/libcalico-go
-LIBCALICO_VERSION?=$(shell git ls-remote git@github.com:projectcalico/libcalico-go $(LIBCALICO_BRANCH) 2>/dev/null | cut -f 1)
-
-## Update libcalico pin in glide.yaml
-update-libcalico:
-	docker run --rm -i \
-	  -v $(CURDIR):/go/src/$(PACKAGE_NAME):rw $$EXTRA_DOCKER_BIND \
-	  -v $(HOME)/.glide:/home/user/.glide:rw \
-	  -e LOCAL_USER_ID=$(LOCAL_USER_ID) \
-	  -w /go/src/$(PACKAGE_NAME) \
-	  $(CALICO_BUILD) /bin/sh -c ' \
-	    echo "Updating libcalico to $(LIBCALICO_VERSION) from $(LIBCALICO_REPO)"; \
-	    export OLD_VER=$$(grep --after 50 libcalico-go glide.yaml |grep --max-count=1 --only-matching --perl-regexp "version:\s*\K[^\s]+") ;\
-	    echo "Old version: $$OLD_VER";\
-	    if [ $(LIBCALICO_VERSION) != $$OLD_VER ]; then \
-	        sed -i "s/$$OLD_VER/$(LIBCALICO_VERSION)/" glide.yaml && \
-	        if [ $(LIBCALICO_REPO) != "github.com/projectcalico/libcalico-go" ]; then \
-	          glide mirror set https://github.com/projectcalico/libcalico-go $(LIBCALICO_REPO) --vcs git; glide mirror list; \
-	        fi;\
-	      glide up --strip-vendor || glide up --strip-vendor; \
-	    fi'
-
-## Build the Calico network plugin and ipam plugins
-$(BIN)/calico $(BIN)/calico-ipam: $(SRC_FILES) vendor
-	-mkdir -p .go-pkg-cache
-	docker run --rm \
-	-e ARCH=$(ARCH) \
-	-e GOARCH=$(ARCH) \
-	-e LOCAL_USER_ID=$(LOCAL_USER_ID) \
-	-v $(CURDIR):/go/src/$(PACKAGE_NAME):ro \
-	-v $(CURDIR)/$(BIN):/go/src/$(PACKAGE_NAME)/$(BIN):rw \
-	-v $(CURDIR)/.go-pkg-cache:/go-cache/:rw \
-	$(LOCAL_BUILD_MOUNTS) \
-	-w /go/src/$(PACKAGE_NAME) \
-	-e GOCACHE=/go-cache \
-	    $(CALICO_BUILD) sh -c '\
-	        go build -v -o $(BIN)/calico -ldflags "-X main.VERSION=$(GIT_VERSION) -s -w" ./cmd/calico && \
-	        go build -v -o $(BIN)/calico-ipam -ldflags "-X main.VERSION=$(GIT_VERSION) -s -w" ./cmd/calico-ipam'
-
-###############################################################################
-# Building the image
-###############################################################################
-image: $(DEPLOY_CONTAINER_MARKER)
-image-all: $(addprefix sub-image-,$(VALIDARCHES))
-sub-image-%:
-	$(MAKE) image ARCH=$*
-
-# ensure we have a real imagetag
 imagetag:
 ifndef IMAGETAG
 	$(error IMAGETAG is undefined - run using make <target> IMAGETAG=X.Y.Z)
@@ -220,9 +164,11 @@ endif
 
 ## push one arch
 push: imagetag $(addprefix sub-single-push-,$(call escapefs,$(PUSH_IMAGES)))
+
 sub-single-push-%:
 	docker push $(call unescapefs,$*:$(IMAGETAG)-$(ARCH))
 
+## push all arches
 push-all: imagetag $(addprefix sub-push-,$(VALIDARCHES))
 sub-push-%:
 	$(MAKE) push ARCH=$* IMAGETAG=$(IMAGETAG)
@@ -230,11 +176,12 @@ sub-push-%:
 ## push multi-arch manifest where supported
 push-manifests: imagetag  $(addprefix sub-manifest-,$(call escapefs,$(PUSH_MANIFEST_IMAGES)))
 sub-manifest-%:
-	# Docker login to hub.docker.com required before running this target as we are using $(DOCKER_CONFIG) holds the docker login credentials
-	# path to credentials based on manifest-tool's requirements here https://github.com/estesp/manifest-tool#sample-usage
+	# Docker login to hub.docker.com required before running this target as we are using
+	# $(DOCKER_CONFIG) holds the docker login credentials path to credentials based on
+	# manifest-tool's requirements here https://github.com/estesp/manifest-tool#sample-usage
 	docker run -t --entrypoint /bin/sh -v $(DOCKER_CONFIG):/root/.docker/config.json $(CALICO_BUILD) -c "/usr/bin/manifest-tool push from-args --platforms $(call join_platforms,$(VALIDARCHES)) --template $(call unescapefs,$*:$(IMAGETAG))-ARCH --target $(call unescapefs,$*:$(IMAGETAG))"
 
-## push default amd64 arch where multi-arch manifest is not supported
+ ## push default amd64 arch where multi-arch manifest is not supported
 push-non-manifests: imagetag $(addprefix sub-non-manifest-,$(call escapefs,$(PUSH_NONMANIFEST_IMAGES)))
 sub-non-manifest-%:
 ifeq ($(ARCH),amd64)
@@ -243,7 +190,7 @@ else
 	$(NOECHO) $(NOOP)
 endif
 
-## tag images of one arch
+## tag images of one arch for all supported registries
 tag-images: imagetag $(addprefix sub-single-tag-images-arch-,$(call escapefs,$(PUSH_IMAGES))) $(addprefix sub-single-tag-images-non-manifest-,$(call escapefs,$(PUSH_NONMANIFEST_IMAGES)))
 
 sub-single-tag-images-arch-%:
@@ -262,65 +209,24 @@ tag-images-all: imagetag $(addprefix sub-tag-images-,$(VALIDARCHES))
 sub-tag-images-%:
 	$(MAKE) tag-images ARCH=$* IMAGETAG=$(IMAGETAG)
 
-$(DEPLOY_CONTAINER_MARKER): Dockerfile.$(ARCH) build fetch-cni-bins
-	docker build -t $(BUILD_IMAGE):latest-$(ARCH) --build-arg QEMU_IMAGE=$(CALICO_BUILD) -f Dockerfile.$(ARCH) .
-ifeq ($(ARCH),amd64)
-	# Need amd64 builds tagged as :latest because Semaphore depends on that
-	docker tag $(BUILD_IMAGE):latest-$(ARCH) $(BUILD_IMAGE):latest
-endif
-	touch $@
-
-.PHONY: fetch-cni-bins
-fetch-cni-bins: $(BIN)/flannel $(BIN)/loopback $(BIN)/host-local $(BIN)/portmap $(BIN)/tuning $(BIN)/bandwidth
-
-$(BIN)/flannel $(BIN)/loopback $(BIN)/host-local $(BIN)/portmap $(BIN)/tuning $(BIN)/bandwidth:
-	mkdir -p $(BIN)
-	$(CURL) -L --retry 5 https://github.com/containernetworking/plugins/releases/download/$(CNI_VERSION)/cni-plugins-linux-$(ARCH)-$(CNI_VERSION).tgz | tar -xz -C $(BIN) ./flannel ./loopback ./host-local ./portmap ./tuning ./bandwidth
-
-###############################################################################
-# Static checks
-###############################################################################
-.PHONY: static-checks
-## Perform static checks on the code.
-static-checks: vendor
-	docker run --rm \
-		-e LOCAL_USER_ID=$(LOCAL_USER_ID) \
-		-v $(CURDIR):/go/src/$(PACKAGE_NAME) \
-		$(CALICO_BUILD) sh -c '\
-			cd  /go/src/$(PACKAGE_NAME) && \
-			gometalinter --deadline=300s --disable-all --enable=goimports --enable=vet --enable=errcheck --vendor -s test_utils ./...'
-
-.PHONY: fix
-## Fix static checks
-fix:
-	goimports -w $(SRC_FILES) $(TEST_SRC_FILES)
-
-.PHONY: install-git-hooks
-## Install Git hooks
-install-git-hooks:
-	./install-git-hooks
-
-foss-checks: vendor
-	@echo Running $@...
-	@docker run --rm -v $(CURDIR):/go/src/$(PACKAGE_NAME):rw \
-	  -e LOCAL_USER_ID=$(LOCAL_USER_ID) \
-	  -e FOSSA_API_KEY=$(FOSSA_API_KEY) \
-	  -w /go/src/$(PACKAGE_NAME) \
-	  $(CALICO_BUILD) /usr/local/bin/fossa
-
 ###############################################################################
 # Unit Tests
 ###############################################################################
 ## Run the unit tests.
-ut: run-k8s-controller build $(BIN)/host-local
+ut: run-k8s-controller $(BIN)/install $(BIN)/host-local $(BIN)/calico-ipam $(BIN)/calico
 	$(MAKE) ut-datastore DATASTORE_TYPE=etcdv3
 	$(MAKE) ut-datastore DATASTORE_TYPE=kubernetes
 
-ut-datastore:
+$(BIN)/calico-ipam $(BIN)/calico: $(BIN)/install
+	cp "$<" "$@"
+
+ut-datastore: $(LOCAL_BUILD_DEP)
 	# The tests need to run as root
 	docker run --rm -t --privileged --net=host \
+	$(EXTRA_DOCKER_ARGS) \
 	-e ETCD_IP=$(LOCAL_IP_ENV) \
-	-e LOCAL_USER_ID=0 \
+	-e LOCAL_USER_ID=$(LOCAL_USER_ID) \
+	-e RUN_AS_ROOT=true \
 	-e ARCH=$(ARCH) \
 	-e PLUGIN=calico \
 	-e BIN=/go/src/$(PACKAGE_NAME)/$(BIN) \
@@ -328,11 +234,11 @@ ut-datastore:
 	-e DATASTORE_TYPE=$(DATASTORE_TYPE) \
 	-e ETCD_ENDPOINTS=http://$(LOCAL_IP_ENV):2379 \
 	-e K8S_API_ENDPOINT=http://127.0.0.1:8080 \
+	-e GO111MODULE=on \
 	-v $(CURDIR):/go/src/$(PACKAGE_NAME):rw \
-	$(LOCAL_BUILD_MOUNTS) \
-	$(CALICO_BUILD) sh -c '\
+	$(CALICO_BUILD) sh -c '$(GIT_CONFIG_SSH) \
 			cd  /go/src/$(PACKAGE_NAME) && \
-			ginkgo -cover -r -skipPackage vendor -skipPackage k8s-install $(GINKGO_ARGS)'
+			ginkgo -cover -r -skipPackage pkg/install $(GINKGO_ARGS)'
 
 ut-etcd: run-k8s-controller build $(BIN)/host-local
 	$(MAKE) ut-datastore DATASTORE_TYPE=etcdv3
@@ -352,28 +258,32 @@ test-cni-versions:
 		make ut CNI_SPEC_VERSION=$$cniversion; \
 	done
 
+config/crd: mod-download
+	mkdir -p config/crd
+	$(DOCKER_GO_BUILD) sh -c ' \
+		cp -r `go list -m -f "{{.Dir}}" github.com/projectcalico/libcalico-go`/config/crd/* config/crd; \
+		chmod +w config/crd/*'
+
 ## Kubernetes apiserver used for tests
-run-k8s-apiserver: stop-k8s-apiserver run-etcd
+run-k8s-apiserver: config/crd stop-k8s-apiserver run-etcd
 	docker run --detach --net=host \
 	  --name calico-k8s-apiserver \
-	  -v `pwd`/vendor/github.com/projectcalico/libcalico-go/test/crds.yaml:/crds.yaml \
+	  -v `pwd`/config:/config \
 	  -v `pwd`/internal/pkg/testutils/private.key:/private.key \
-	  gcr.io/google_containers/hyperkube-$(ARCH):$(K8S_VERSION) \
-	  /hyperkube apiserver \
+	  gcr.io/google_containers/hyperkube-$(ARCH):$(K8S_VERSION) kube-apiserver \
 	    --etcd-servers=http://$(LOCAL_IP_ENV):2379 \
 	    --service-cluster-ip-range=10.101.0.0/16 \
 	    --service-account-key-file=/private.key
 	# Wait until the apiserver is accepting requests.
 	while ! docker exec calico-k8s-apiserver kubectl get nodes; do echo "Waiting for apiserver to come up..."; sleep 2; done
-	docker exec calico-k8s-apiserver kubectl apply -f /crds.yaml
+	while ! docker exec calico-k8s-apiserver kubectl apply -f /config/crd; do echo "Waiting for CRDs..."; sleep 2; done
 
 ## Kubernetes controller manager used for tests
 run-k8s-controller: stop-k8s-controller run-k8s-apiserver
 	docker run --detach --net=host \
 	  --name calico-k8s-controller \
 	  -v `pwd`/internal/pkg/testutils/private.key:/private.key \
-	  gcr.io/google_containers/hyperkube-$(ARCH):$(K8S_VERSION) \
-	  /hyperkube controller-manager \
+	  gcr.io/google_containers/hyperkube-$(ARCH):$(K8S_VERSION) kube-controller-manager \
 	    --master=127.0.0.1:8080 \
 	    --min-resync-period=3m \
 	    --allocate-node-cidrs=true \
@@ -407,30 +317,29 @@ stop-etcd:
 ###############################################################################
 # We pre-build the test binary so that we can run it outside a container and allow it
 # to interact with docker.
-k8s-install/scripts/install_cni.test: vendor k8s-install/scripts/*.go
+pkg/install/install.test: pkg/install/*.go
 	-mkdir -p .go-pkg-cache
 	docker run --rm \
 	-e LOCAL_USER_ID=$(LOCAL_USER_ID) \
 	-v $(CURDIR):/go/src/$(PACKAGE_NAME):rw \
 	-v $(CURDIR)/.go-pkg-cache:/go/pkg/:rw \
-		$(CALICO_BUILD) sh -c '\
+		$(CALICO_BUILD) sh -c '$(GIT_CONFIG_SSH) \
 			cd /go/src/$(PACKAGE_NAME) && \
-			go test ./k8s-install/scripts -c --tags install_cni_test -o ./k8s-install/scripts/install_cni.test'
+			go test ./pkg/install -c --tags install_test -o ./pkg/install/install.test'
 
 .PHONY: test-install-cni
-## Test the install-cni.sh script
-test-install-cni: image k8s-install/scripts/install_cni.test
-	cd k8s-install/scripts && CONTAINER_NAME=$(BUILD_IMAGE) ./install_cni.test
+## Test the install
+test-install-cni: image pkg/install/install.test
+	cd pkg/install && CONTAINER_NAME=$(BUILD_IMAGE) ./install.test
 
 ###############################################################################
 # CI/CD
 ###############################################################################
 .PHONY: ci
-## Run what CI runs
-ci: clean static-checks test-cni-versions image-all test-install-cni
+ci: clean mod-download build static-checks test-cni-versions image-all test-install-cni
 
 ## Deploys images to registry
-cd:
+cd: image-all
 ifndef CONFIRM
 	$(error CONFIRM is undefined - run using make <target> CONFIRM=true)
 endif
@@ -438,7 +347,11 @@ ifndef BRANCH_NAME
 	$(error BRANCH_NAME is undefined - run using make <target> BRANCH_NAME=var or set an environment variable)
 endif
 	$(MAKE) tag-images-all push-all push-manifests push-non-manifests  IMAGETAG=${BRANCH_NAME} EXCLUDEARCH="$(EXCLUDEARCH)"
-	$(MAKE) tag-images-all push-all push-manifests push-non-manifests  IMAGETAG=$(shell git describe --tags --dirty --always --long) EXCLUDEARCH="$(EXCLUDEARCH)"
+	$(MAKE) tag-images-all push-all push-manifests push-non-manifests  IMAGETAG=${GIT_VERSION} EXCLUDEARCH="$(EXCLUDEARCH)"
+
+## Build fv binary for Windows
+$(BIN_WIN)/win-fv.exe: $(LOCAL_BUILD_DEP) $(WINFV_SRCFILES)
+	$(DOCKER_RUN) -e GOOS=windows $(CALICO_BUILD) sh -c '$(GIT_CONFIG_SSH) go test ./win_tests -c -o $(BIN_WIN)/win-fv.exe'
 
 ###############################################################################
 # Release
@@ -553,26 +466,10 @@ endif
 ## Run kube-proxy
 run-kube-proxy:
 	-docker rm -f calico-kube-proxy
-	docker run --name calico-kube-proxy -d --net=host --privileged gcr.io/google_containers/hyperkube:$(K8S_VERSION) /hyperkube proxy --master=http://127.0.0.1:8080 --v=2
+	docker run --name calico-kube-proxy -d --net=host --privileged gcr.io/google_containers/hyperkube:$(K8S_VERSION) kube-proxy --master=http://127.0.0.1:8080 --v=2
 
 .PHONY: test-watch
 ## Run the unit tests, watching for changes.
-test-watch: $(BIN)/calico $(BIN)/calico-ipam run-etcd run-k8s-apiserver
+test-watch: $(BIN)/install run-etcd run-k8s-apiserver
 	# The tests need to run as root
-	CGO_ENABLED=0 ETCD_IP=127.0.0.1 PLUGIN=calico GOPATH=$(GOPATH) $(shell which ginkgo) watch -skipPackage k8s-install -skipPackage vendor
-
-.PHONY: help
-help: # Some kind of magic from https://gist.github.com/rcmachado/af3db315e31383502660
-	$(info Available targets)
-	@awk '/^[a-zA-Z\-\_0-9\/]+:/ {                                      \
-	        nb = sub( /^## /, "", helpMsg );                                \
-	        if(nb == 0) {                                                   \
-	                helpMsg = $$0;                                              \
-	                nb = sub( /^[^:]*:.* ## /, "", helpMsg );                   \
-	        }                                                               \
-	        if (nb)                                                         \
-	                printf "\033[1;31m%-" width "s\033[0m %s\n", $$1, helpMsg;  \
-	}                                                                   \
-	{ helpMsg = $$0 }'                                                  \
-	width=20                                                            \
-	$(MAKEFILE_LIST)
+	CGO_ENABLED=0 ETCD_IP=127.0.0.1 PLUGIN=calico GOPATH=$(GOPATH) $(shell which ginkgo) watch -skipPackage pkg/install

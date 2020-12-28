@@ -1,4 +1,4 @@
-// Copyright 2015 Tigera Inc
+// Copyright (c) 2015-2020 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 package ipamplugin
 
 import (
@@ -20,12 +21,15 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	cnitypes "github.com/containernetworking/cni/pkg/types"
 	"github.com/containernetworking/cni/pkg/types/current"
 	cniSpecVersion "github.com/containernetworking/cni/pkg/version"
+	"github.com/sirupsen/logrus"
+
 	"github.com/projectcalico/cni-plugin/internal/pkg/utils"
 	"github.com/projectcalico/cni-plugin/pkg/types"
 	"github.com/projectcalico/cni-plugin/pkg/upgrade"
@@ -35,7 +39,6 @@ import (
 	"github.com/projectcalico/libcalico-go/lib/ipam"
 	"github.com/projectcalico/libcalico-go/lib/logutils"
 	cnet "github.com/projectcalico/libcalico-go/lib/net"
-	"github.com/sirupsen/logrus"
 )
 
 func Main(version string) {
@@ -117,7 +120,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 
 	nodename := utils.DetermineNodename(conf)
 
-	utils.ConfigureLogging(conf.LogLevel)
+	utils.ConfigureLogging(conf)
 
 	calicoClient, err := utils.CreateClient(conf)
 	if err != nil {
@@ -155,6 +158,9 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 
 	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+
 	r := &current.Result{}
 	if ipamArgs.IP != nil {
 		logger.Infof("Calico CNI IPAM request IP: %v", ipamArgs.IP)
@@ -217,15 +223,32 @@ func cmdAdd(args *skel.CmdArgs) error {
 			return err
 		}
 
-		logger.Infof("Calico CNI IPAM handle=%s", handleID)
+		logger.Debugf("Calico CNI IPAM handle=%s", handleID)
+		var maxBlocks int
+		if conf.WindowsUseSingleNetwork {
+			// When running in single-network mode (for kube-proxy compatibility), limit the
+			// number of blocks we're allowed to create.
+			logrus.Info("Running in single-HNS-network mode, limiting number of IPAM blocks to 1.")
+			maxBlocks = 1
+		}
 		assignArgs := ipam.AutoAssignArgs{
-			Num4:      num4,
-			Num6:      num6,
-			HandleID:  &handleID,
-			Hostname:  nodename,
-			IPv4Pools: v4pools,
-			IPv6Pools: v6pools,
-			Attrs:     attrs,
+			Num4:             num4,
+			Num6:             num6,
+			HandleID:         &handleID,
+			Hostname:         nodename,
+			IPv4Pools:        v4pools,
+			IPv6Pools:        v6pools,
+			MaxBlocksPerHost: maxBlocks,
+			Attrs:            attrs,
+		}
+		if runtime.GOOS == "windows" {
+			rsvdAttrWindows := &ipam.HostReservedAttr{
+				StartOfBlock: 3,
+				EndOfBlock:   1,
+				Handle:       ipam.WindowsReservedHandle,
+				Note:         "windows host rsvd",
+			}
+			assignArgs.HostReservedAttrIPv4s = rsvdAttrWindows
 		}
 		logger.WithField("assignArgs", assignArgs).Info("Auto assigning IP")
 		assignedV4, assignedV6, err := calicoClient.IPAM().AutoAssign(ctx, assignArgs)
@@ -238,7 +261,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 			if len(assignedV4) != num4 {
 				return fmt.Errorf("failed to request %d IPv4 addresses. IPAM allocated only %d", num4, len(assignedV4))
 			}
-			ipV4Network := net.IPNet{IP: assignedV4[0].IP, Mask: net.CIDRMask(32, 32)}
+			ipV4Network := net.IPNet{IP: assignedV4[0].IP, Mask: assignedV4[0].Mask}
 			r.IPs = append(r.IPs, &current.IPConfig{
 				Version: "4",
 				Address: ipV4Network,
@@ -249,13 +272,13 @@ func cmdAdd(args *skel.CmdArgs) error {
 			if len(assignedV6) != num6 {
 				return fmt.Errorf("failed to request %d IPv6 addresses. IPAM allocated only %d", num6, len(assignedV6))
 			}
-			ipV6Network := net.IPNet{IP: assignedV6[0].IP, Mask: net.CIDRMask(128, 128)}
+			ipV6Network := net.IPNet{IP: assignedV6[0].IP, Mask: assignedV6[0].Mask}
 			r.IPs = append(r.IPs, &current.IPConfig{
 				Version: "6",
 				Address: ipV6Network,
 			})
 		}
-		logger.WithFields(logrus.Fields{"result.IPs": r.IPs}).Info("IPAM Result")
+		logger.WithFields(logrus.Fields{"result.IPs": r.IPs}).Debug("IPAM Result")
 	}
 
 	// Print result to stdout, in the format defined by the requested cniVersion.
@@ -268,7 +291,7 @@ func cmdDel(args *skel.CmdArgs) error {
 		return fmt.Errorf("failed to load netconf: %v", err)
 	}
 
-	utils.ConfigureLogging(conf.LogLevel)
+	utils.ConfigureLogging(conf)
 
 	calicoClient, err := utils.CreateClient(conf)
 	if err != nil {
@@ -289,7 +312,6 @@ func cmdDel(args *skel.CmdArgs) error {
 	}
 
 	handleID := utils.GetHandleID(conf.Name, args.ContainerID, epIDs.WEPName)
-
 	logger := logrus.WithFields(logrus.Fields{
 		"Workload":    epIDs.WEPName,
 		"ContainerID": epIDs.ContainerID,
@@ -298,6 +320,9 @@ func cmdDel(args *skel.CmdArgs) error {
 
 	logger.Info("Releasing address using handleID")
 	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+
 	if err := calicoClient.IPAM().ReleaseByHandle(ctx, handleID); err != nil {
 		if _, ok := err.(errors.ErrorResourceDoesNotExist); !ok {
 			logger.WithError(err).Error("Failed to release address")

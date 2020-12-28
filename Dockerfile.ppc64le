@@ -1,11 +1,12 @@
-FROM ppc64le/debian:9.8-slim
+FROM scratch
 
-LABEL maintainer "Casey Davenport <casey@tigera.io>"
+LABEL maintainer "maintainers@projectcalico.org"
 
-ADD bin/ppc64le/ /opt/cni/bin/
-ADD k8s-install/scripts/install-cni.sh /install-cni.sh
-ADD k8s-install/scripts/calico.conf.default /calico.conf.tmp
+ADD licenses/ /licenses
+ADD LICENSE /licenses/
+
+ADD bin/ppc64le /opt/cni/bin/
 
 ENV PATH=$PATH:/opt/cni/bin
 WORKDIR /opt/cni/bin
-CMD ["/opt/cni/bin/calico"]
+CMD ["/opt/cni/bin/install"]
