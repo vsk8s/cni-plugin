@@ -1,16 +1,18 @@
 #!/usr/bin/make -f
 include /usr/share/dpkg/pkg-info.mk
-export GOPATH
 
-override_dh_auto_clean:
-	dh_auto_clean -O--buildsystem=golang
+GO_LDFLAGS += -X main.VERSION=$(git rev-parse HEAD || echo '<unknown>')
+
+export CGO_CFLAGS            := $(CFLAGS)
+export CGO_CPPFLAGS          := $(CPPFLAGS)
+export GO111MODULE=on
+export GOPROXY=
 
 override_dh_auto_install:
-#	dh_auto_install -- --no-source
-	/bin/true
+	dh_auto_install -- --no-source
 
 %:
-	dh $@ --buildsystem=golang --with=golang
+	dh $@ --buildsystem=golang --with=golang --builddirectory=_build
 
 override_dh_auto_test:
 	# The test suite doesn't really work outside of the provided Docker
@@ -18,5 +20,4 @@ override_dh_auto_test:
 	/bin/true
 
 override_dh_auto_build:
-	dh_auto_build -O--buildsystem=golang -- -ldflags "-X main.VERSION=$(shell git rev-parse HEAD || echo '<unknown>')" || /bin/true
-
+	dh_auto_build -- -tags '$(TAGS)' -ldflags '$(GO_LDFLAGS)'

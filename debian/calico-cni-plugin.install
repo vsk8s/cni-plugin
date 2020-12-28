@@ -1,2 +1,2 @@
-obj-x86_64-linux-gnu/bin/calico /opt/cni/bin/
-obj-x86_64-linux-gnu/bin/calico-ipam /opt/cni/bin/
+_build/bin/calico /opt/cni/bin/
+_build/bin/calico-ipam /opt/cni/bin/
