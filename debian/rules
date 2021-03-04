@@ -11,6 +11,7 @@ export GOPROXY=
 
 override_dh_auto_install:
 	dh_auto_install -- --no-source
+	rm debian/calico-cni-plugin/usr/bin/calico
 
 %:
 	dh $@ --buildsystem=golang --with=golang --builddirectory=_build

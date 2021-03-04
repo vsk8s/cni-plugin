@@ -1,3 +1,9 @@
+calico-cni-plugin (3.17.1-2) unstable; urgency=medium
+
+  * Do not also install the binary to /usr/bin
+
+ -- Maximilian Falkenstein <maximilian.falkenstein@sos.ethz.ch>  Thu, 04 Mar 2021 22:36:05 +0100
+
 calico-cni-plugin (3.17.1-1) unstable; urgency=medium
 
   * Bump to 3.17.1
