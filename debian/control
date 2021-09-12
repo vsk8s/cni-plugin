@@ -1,0 +1,31 @@
+Source: calico-cni-plugin
+Section: devel
+Priority: optional
+Maintainer: Maximilian Falkenstein <maximilian.falkenstein@sos.ethz.ch>
+Build-Depends: debhelper (>= 9),
+               dh-golang,
+               golang-go
+Standards-Version: 4.2.1
+Homepage: https://github.com/projectcalico/cni-plugin
+XS-Go-Import-Path: github.com/projectcalico/cni-plugin
+
+Package: calico-cni-plugin
+Architecture: any
+Built-Using: ${misc:Built-Using}
+Depends: ${misc:Depends},
+         ${shlibs:Depends}
+Description: The calico cni plugin
+ .
+ This repository contains the source for the calico/node container.
+ Get Started Using Calico For users who want to learn more about
+ the project or get started with Calico, see the documentation on
+ docs.projectcalico.org (https://docs.projectcalico.org).  Get Started
+ Developing Calico Contributions to this code are welcome! Before
+ starting, make sure you've read the Calico contributor guide
+ (https://github.com/projectcalico/calico/blob/master/CONTRIBUTING_CODE.md).
+ Dependencies The entire build can be run within a container, which means
+ the only dependencies you'll need are a functioning Docker installation
+ (https://docs.docker.com/engine/installation/).  Building The code in
+ this repository can be built and tested using the Makefile.  • make
+ calico/node will produce the calico/node docker image.  For more
+ information, see make help.

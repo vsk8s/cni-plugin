@@ -1,0 +1,25 @@
+#!/usr/bin/make -f
+include /usr/share/dpkg/pkg-info.mk
+
+GO_LDFLAGS += -X main.VERSION=$(shell git rev-parse HEAD || echo '<unknown>')
+DH_GOLANG_EXCLUDES += win_tests
+export DH_GOLANG_EXCLUDES
+export CGO_CFLAGS            := $(CFLAGS)
+export CGO_CPPFLAGS          := $(CPPFLAGS)
+export GO111MODULE=on
+export GOPROXY=
+
+override_dh_auto_install:
+	dh_auto_install -- --no-source
+	rm debian/calico-cni-plugin/usr/bin/calico
+
+%:
+	dh $@ --buildsystem=golang --with=golang --builddirectory=_build
+
+override_dh_auto_test:
+	# The test suite doesn't really work outside of the provided Docker
+	# container since it depends on a running etcd...
+	/bin/true
+
+override_dh_auto_build:
+	dh_auto_build -- -ldflags '$(GO_LDFLAGS)'

@@ -1,0 +1,6 @@
+.debhelper/
+calico-cni-plugin.debhelper.log
+calico-cni-plugin.substvars
+calico-cni-plugin/
+debhelper-build-stamp
+files
